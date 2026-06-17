@@ -6,6 +6,8 @@ Usage examples:
     python read_frames.py
     python read_frames.py --serial 123456789012
     python read_frames.py --width 1280 --height 720 --fps 30
+
+    python read_frames.py --ir --ir-streams 1 2 --fps 15 # 30帧比率带宽不够
 """
 
 import argparse
@@ -77,13 +79,16 @@ def choose_serial(devices, requested_serial=None):
     return None
 
 
-def start_pipeline(serial, width, height, fps, enable_depth):
+def start_pipeline(serial, width, height, fps, enable_depth, enable_ir, ir_streams):
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_device(serial)
     config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
     if enable_depth:
         config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+    if enable_ir:
+        for stream_index in ir_streams:
+            config.enable_stream(rs.stream.infrared, stream_index, width, height, rs.format.y8, fps)
 
     profile = pipeline.start(config)
 
@@ -119,9 +124,15 @@ def rs_intrinsics_to_dict(intrinsics):
     }
 
 
-def get_stream_intrinsics(profile, stream):
+def get_stream_intrinsics(profile, stream, stream_index=None):
     try:
-        return rs_intrinsics_to_dict(profile.get_stream(stream).as_video_stream_profile().get_intrinsics())
+        for stream_profile in profile.get_streams():
+            if stream_profile.stream_type() != stream:
+                continue
+            if stream_index is not None and stream_profile.stream_index() != stream_index:
+                continue
+            return rs_intrinsics_to_dict(stream_profile.as_video_stream_profile().get_intrinsics())
+        return None
     except RuntimeError:
         return None
 
@@ -133,6 +144,17 @@ def sanitize_name(value):
 def make_depth_preview(depth_image):
     depth_8bit = cv2.convertScaleAbs(depth_image, alpha=0.03)
     return cv2.applyColorMap(depth_8bit, cv2.COLORMAP_JET)
+
+
+def make_ir_preview(ir_image):
+    return cv2.cvtColor(ir_image, cv2.COLOR_GRAY2BGR)
+
+
+def match_preview_size(image, target_shape):
+    target_height, target_width = target_shape[:2]
+    if image.shape[:2] == (target_height, target_width):
+        return image
+    return cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
 def draw_status(preview, recording, recorded_frames, elapsed):
@@ -165,10 +187,13 @@ class RecordingSession:
         height,
         fps,
         enable_depth,
+        enable_ir,
+        ir_streams,
         depth_scale,
         data_dir,
         color_intrinsics,
         depth_intrinsics,
+        ir_intrinsics,
         save_frame_images=True,
     ):
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -178,19 +203,26 @@ class RecordingSession:
         self.session_dir = Path(data_dir) / self.session_id
         self.rgb_frame_dir = self.session_dir / "rgb"
         self.depth_frame_dir = self.session_dir / "depth"
+        self.ir_root = self.session_dir / "ir"
         self.rgb_path = self.session_dir / "rgb.mp4"
         self.metadata_path = self.session_dir / "metadata.json"
         self.frames_path = self.session_dir / "frames.jsonl"
         self.enable_depth = enable_depth
+        self.enable_ir = enable_ir
+        self.ir_streams = list(ir_streams)
         self.save_frame_images = save_frame_images
         self.color_intrinsics = color_intrinsics
         self.depth_intrinsics = depth_intrinsics
+        self.ir_intrinsics = ir_intrinsics
 
         self.session_dir.mkdir(parents=True, exist_ok=True)
         if self.save_frame_images:
             self.rgb_frame_dir.mkdir(parents=True, exist_ok=True)
         if self.enable_depth:
             self.depth_frame_dir.mkdir(parents=True, exist_ok=True)
+        if self.enable_ir:
+            for stream_index in self.ir_streams:
+                (self.ir_root / f"ir{stream_index}").mkdir(parents=True, exist_ok=True)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.writer = cv2.VideoWriter(str(self.rgb_path), fourcc, fps, (width, height))
@@ -207,12 +239,22 @@ class RecordingSession:
         self.frame_count = 0
         self.depth_frame_count = 0
         self.missing_depth_count = 0
+        self.ir_frame_counts = {stream_index: 0 for stream_index in self.ir_streams}
+        self.missing_ir_count = {stream_index: 0 for stream_index in self.ir_streams}
         self.closed = False
         self.frames_file = self.frames_path.open("w", encoding="utf-8")
 
         self._write_metadata(finished=False)
 
-    def write(self, color_image, depth_image, color_frame=None, depth_frame=None):
+    def write(
+        self,
+        color_image,
+        depth_image,
+        ir_images=None,
+        color_frame=None,
+        depth_frame=None,
+        ir_frames=None,
+    ):
         frame_index = self.frame_count
         self.writer.write(color_image)
         self.frame_count += 1
@@ -241,12 +283,33 @@ class RecordingSession:
             self.depth_frame_count += 1
             has_depth = True
 
+        ir_rel = {}
+        has_ir = False
+        if self.enable_ir:
+            ir_images = ir_images or {}
+            for stream_index in self.ir_streams:
+                ir_image = ir_images.get(stream_index)
+                if ir_image is None:
+                    self.missing_ir_count[stream_index] += 1
+                    ir_rel[str(stream_index)] = None
+                    continue
+
+                ir_path = self.ir_root / f"ir{stream_index}" / f"{frame_index:06d}.png"
+                ok = cv2.imwrite(str(ir_path), ir_image)
+                if not ok:
+                    raise RuntimeError(f"Could not write IR frame: {ir_path}")
+                self.ir_frame_counts[stream_index] += 1
+                ir_rel[str(stream_index)] = ir_path.relative_to(self.session_dir).as_posix()
+                has_ir = True
+
         frame_record = {
             "frame_index": frame_index,
             "host_time_s": time.time(),
             "rgb_path": rgb_rel,
             "depth_path": depth_rel,
+            "ir_paths": ir_rel if self.enable_ir else None,
             "has_depth": has_depth,
+            "has_ir": has_ir,
         }
         if color_frame is not None:
             frame_record.update(
@@ -262,6 +325,17 @@ class RecordingSession:
                     "depth_frame_number": int(depth_frame.get_frame_number()),
                 }
             )
+        if ir_frames is not None:
+            frame_record["ir_timestamp_ms"] = {
+                str(stream_index): float(ir_frame.get_timestamp())
+                for stream_index, ir_frame in ir_frames.items()
+                if ir_frame is not None
+            }
+            frame_record["ir_frame_number"] = {
+                str(stream_index): int(ir_frame.get_frame_number())
+                for stream_index, ir_frame in ir_frames.items()
+                if ir_frame is not None
+            }
 
         self.frames_file.write(json.dumps(frame_record) + "\n")
 
@@ -282,12 +356,16 @@ class RecordingSession:
             "rgb_path": self.rgb_path.resolve(),
             "rgb_frame_dir": self.rgb_frame_dir.resolve() if self.save_frame_images else None,
             "depth_dir": self.depth_frame_dir.resolve() if self.enable_depth else None,
+            "ir_dir": self.ir_root.resolve() if self.enable_ir else None,
             "metadata_path": self.metadata_path.resolve(),
             "frames_path": self.frames_path.resolve(),
             "depth_enabled": self.enable_depth,
+            "ir_enabled": self.enable_ir,
             "rgb_frames": self.frame_count,
             "depth_frames": self.depth_frame_count,
             "missing_depth_frames": self.missing_depth_count,
+            "ir_frames": {str(k): v for k, v in self.ir_frame_counts.items()},
+            "missing_ir_frames": {str(k): v for k, v in self.missing_ir_count.items()},
             "duration_seconds": elapsed,
             "average_fps": self.frame_count / elapsed if elapsed > 0 else 0.0,
         }
@@ -306,8 +384,13 @@ class RecordingSession:
             "depth_format": "16-bit PNG, raw RealSense z16 units" if self.enable_depth else None,
             "depth_scale_meters_per_unit": self.depth_scale,
             "depth_aligned_to_color": self.enable_depth,
+            "ir_enabled": self.enable_ir,
+            "ir_streams": self.ir_streams if self.enable_ir else [],
+            "ir_dir": self.ir_root.as_posix() if self.enable_ir else None,
+            "ir_format": "8-bit grayscale PNG from RealSense infrared Y8 stream" if self.enable_ir else None,
             "color_intrinsics": self.color_intrinsics,
             "depth_intrinsics": self.depth_intrinsics,
+            "ir_intrinsics": self.ir_intrinsics,
             "humanego_note": "Use color_intrinsics.k with aligned depth. Convert depth PNG to millimetres before HumanEgo DepthLifter if depth_scale != 0.001.",
             "frames_jsonl": self.frames_path.as_posix(),
             "started_at": self.started_at.isoformat(timespec="seconds"),
@@ -315,6 +398,8 @@ class RecordingSession:
             "rgb_frames": self.frame_count,
             "depth_frames": self.depth_frame_count,
             "missing_depth_frames": self.missing_depth_count,
+            "ir_frames": {str(k): v for k, v in self.ir_frame_counts.items()},
+            "missing_ir_frames": {str(k): v for k, v in self.missing_ir_count.items()},
         }
         if finished:
             metadata["finished_at"] = datetime.now().isoformat(timespec="seconds")
@@ -340,6 +425,10 @@ def print_recording_summary(summary):
     if summary["depth_enabled"]:
         print(f"  Depth frames:   {summary['depth_frames']}")
         print(f"  Missing depth:  {summary['missing_depth_frames']}")
+    if summary["ir_enabled"]:
+        print(f"  IR frames:      {summary['ir_dir']}")
+        print(f"  IR counts:      {summary['ir_frames']}")
+        print(f"  Missing IR:     {summary['missing_ir_frames']}")
     print(f"  Duration:       {summary['duration_seconds']:.2f} s")
     print(f"  Average FPS:    {summary['average_fps']:.2f}")
 
@@ -349,16 +438,23 @@ def preview_and_record(pipeline, profile, args, serial):
     window_name = "RealSense Preview - ENTER start, SPACE stop/save"
     session = None
     enable_depth = not args.no_depth
+    enable_ir = args.ir
+    ir_streams = list(args.ir_streams)
     depth_scale = get_depth_scale(profile) if enable_depth else None
     color_intrinsics = get_stream_intrinsics(profile, rs.stream.color)
     depth_intrinsics = get_stream_intrinsics(profile, rs.stream.depth) if enable_depth else None
+    ir_intrinsics = {
+        str(stream_index): get_stream_intrinsics(profile, rs.stream.infrared, stream_index)
+        for stream_index in ir_streams
+    } if enable_ir else None
     segment_count = 0
 
     try:
         while True:
-            frames = pipeline.wait_for_frames()
+            raw_frames = pipeline.wait_for_frames()
+            frames = raw_frames
             if enable_depth:
-                frames = align.process(frames)
+                frames = align.process(raw_frames)
 
             color_frame = frames.get_color_frame()
             if not color_frame:
@@ -371,14 +467,39 @@ def preview_and_record(pipeline, profile, args, serial):
             else:
                 depth_image = None
 
-            if session is not None:
-                session.write(color_image, depth_image, color_frame=color_frame, depth_frame=depth_frame if enable_depth else None)
+            ir_images = None
+            ir_frames = None
+            if enable_ir:
+                ir_images = {}
+                ir_frames = {}
+                for stream_index in ir_streams:
+                    ir_frame = raw_frames.get_infrared_frame(stream_index)
+                    ir_frames[stream_index] = ir_frame
+                    ir_images[stream_index] = np.asanyarray(ir_frame.get_data()) if ir_frame else None
 
+            if session is not None:
+                session.write(
+                    color_image,
+                    depth_image,
+                    ir_images=ir_images,
+                    color_frame=color_frame,
+                    depth_frame=depth_frame if enable_depth else None,
+                    ir_frames=ir_frames,
+                )
+
+            preview_parts = [color_image]
             if depth_image is not None:
                 depth_preview = make_depth_preview(depth_image)
-                preview = np.hstack((color_image, depth_preview))
-            else:
-                preview = color_image.copy()
+                preview_parts.append(match_preview_size(depth_preview, color_image.shape))
+            if enable_ir and ir_images:
+                for stream_index in ir_streams:
+                    ir_image = ir_images.get(stream_index)
+                    if ir_image is None:
+                        continue
+                    ir_preview = make_ir_preview(ir_image)
+                    preview_parts.append(match_preview_size(ir_preview, color_image.shape))
+
+            preview = np.hstack(preview_parts) if len(preview_parts) > 1 else color_image.copy()
 
             elapsed = time.time() - session.started_time if session is not None else 0.0
             recorded_frames = session.frame_count if session is not None else 0
@@ -395,10 +516,13 @@ def preview_and_record(pipeline, profile, args, serial):
                         height=args.height,
                         fps=args.fps,
                         enable_depth=enable_depth,
+                        enable_ir=enable_ir,
+                        ir_streams=ir_streams,
                         depth_scale=depth_scale,
                         data_dir=args.data_dir,
                         color_intrinsics=color_intrinsics,
                         depth_intrinsics=depth_intrinsics,
+                        ir_intrinsics=ir_intrinsics,
                         save_frame_images=not args.no_frame_images,
                     )
                     segment_count += 1
@@ -441,6 +565,8 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=30, help="Stream FPS.")
     parser.add_argument("--data-dir", type=str, default="data", help="Output directory.")
     parser.add_argument("--no-depth", action="store_true", help="Record RGB only; do not stream or save depth frames.")
+    parser.add_argument("--ir", action="store_true", help="Record infrared frames as 8-bit grayscale PNGs.")
+    parser.add_argument("--ir-streams", type=int, nargs="+", default=[1], choices=[1, 2], help="Infrared stream indices to record, usually 1 or 1 2.")
     parser.add_argument("--no-frame-images", action="store_true", help="Do not save per-frame RGB PNGs; keeps only rgb.mp4 plus depth/metadata.")
     parser.add_argument("--depth", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -460,8 +586,10 @@ def main():
     print("Press ESC or q in the preview window to exit the recording loop.")
     if args.no_depth:
         print("Depth recording is disabled; RGB only mode is active.")
+    if args.ir:
+        print(f"Infrared recording is enabled for stream(s): {args.ir_streams}.")
 
-    pipeline, profile = start_pipeline(serial, args.width, args.height, args.fps, not args.no_depth)
+    pipeline, profile = start_pipeline(serial, args.width, args.height, args.fps, not args.no_depth, args.ir, args.ir_streams)
     preview_and_record(pipeline, profile, args, serial)
     return 0
 
