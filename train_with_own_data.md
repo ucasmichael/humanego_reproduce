@@ -45,9 +45,9 @@ aligned RGB-D + camera intrinsics + hand pose/grasp (+ camera pose)
 | aligned `depth.png` | 必须 | DepthLifter 将 2D object keypoints 反投影到 3D | `read_frames.py` 已保存，转换时变成毫米单位 |
 | `camera intrinsics K` | 必须 | 反投影 `u,v,depth -> X,Y,Z` | 从 RealSense SDK 自动写入 `metadata.json` |
 | per-frame timestamp | 必须 | 对齐 RGB-D、手位姿、相机位姿 | `frames.jsonl` |
-| `T_hand_to_camera` 或 `T_hand_to_world` | 必须 | 训练目标中的手部动作轨迹 | 由 WoVR/外部手部跟踪导出 JSONL |
+| `T_hand_to_camera` 或 `T_hand_to_world` | 必须 | 训练目标中的手部动作轨迹 | 由 HaWoR/外部手部跟踪导出 JSONL |
 | `grasp` 或 `gripper_q` | 强烈建议 | 决定是否抓取和物体 latch | 外部估计；没有就只能用默认值跑通 |
-| `T_camera_to_world` | 移动相机必须 | 接近 Aria 的 ego camera trajectory | 由 WoVR/SLAM 导出 JSONL |
+| `T_camera_to_world` | 移动相机必须 | 接近 Aria 的 ego camera trajectory | 由 HaWoR/SLAM 导出 JSONL |
 | task object prompts | 必须 | 指定要分割/跟踪的物体 | 写到 `cfg/preprocess/tasks/<task>.yaml` |
 
 如果你想尽可能贴近 Aria：
@@ -96,7 +96,7 @@ aligned RGB-D + camera intrinsics + hand pose/grasp (+ camera pose)
 - `rgb_path`
 - `depth_path`
 
-这些字段用于后续把 WoVR 的手/相机位姿按时间戳对齐到每帧 RGB-D。
+这些字段用于后续把 HaWoR 的手/相机位姿按时间戳对齐到每帧 RGB-D。
 
 ## 2. Step-by-step 采集 pipeline
 
@@ -134,7 +134,7 @@ python read_frames.py \
 
 ### Step 3. 同步导出手/相机位姿
 
-你需要从 WoVR 或其他系统导出 JSONL。时间戳要尽可能和 `frames.jsonl` 里的 `host_time_s` 同源；如果不同源，必须先做时间偏移校正。
+你需要从 HaWoR 或其他系统导出 JSONL。时间戳要尽可能和 `frames.jsonl` 里的 `host_time_s` 同源；如果不同源，必须先做时间偏移校正。
 
 推荐手部位姿格式：
 
@@ -408,12 +408,12 @@ data/serve_bread_rs/teaching/
 
 和 Aria/MPS 对齐的等价关系：
 
-| Aria/MPS | RealSense/WoVR 替代 |
+| Aria/MPS | RealSense/HaWoR 替代 |
 |---|---|
 | `sample.vrs` RGB stream | aligned `rgb/*.png` + `rgb.mp4` |
 | VRS camera calibration | RealSense `color_intrinsics.k` |
-| MPS SLAM `closed_loop_trajectory.csv` | WoVR/SLAM `T_camera_to_world` JSONL |
-| MPS hand tracking | WoVR `T_hand_to_camera/world` JSONL |
+| MPS SLAM `closed_loop_trajectory.csv` | HaWoR/SLAM `T_camera_to_world` JSONL |
+| MPS hand tracking | HaWoR `T_hand_to_camera/world` JSONL |
 | MPS timestamps | `frames.jsonl` + pose JSONL timestamps |
 | Aria multi-view triangulation | RealSense `depth.png + K` via `DepthLifter` |
 | `training_data.json` | `RobotDatasetGen` 输出 |
