@@ -607,37 +607,222 @@ data/serve_bread_rs/teaching/
 
 ## 6. 最小可运行命令总览
 
-采集：
+下面以 `pick_banana_into_the_pot` 为例，当前完整链路是：
+
+```text
+RealSense RGB-D raw session
+-> WiLoR + aligned depth 生成 hand_poses_wilor.jsonl
+-> prepare_humanego_session.py 转成 HumanEgo RobotPreprocess session
+-> RobotPreprocess 生成 training_data.json
+-> FlowMatchingTrainer 训练
+```
+
+### 6.1 采集 RealSense RGB-D
 
 ```bash
 cd /data/lyx/humanego_reproduce/realsense_collect_data
-python read_frames.py --width 640 --height 480 --fps 30 --data-dir ./data
+
+python read_frames.py \
+  --width 640 \
+  --height 480 \
+  --fps 15 \
+  --data-dir /data/lyx/datasets/egodata/data0617_depth_ir
 ```
 
-转换：
+采集结束后得到类似：
+
+```text
+/data/lyx/datasets/egodata/data0617_depth_ir/20260617_155420_318122300934/
+├── metadata.json
+├── frames.jsonl
+├── rgb.mp4
+├── rgb/
+└── depth/
+```
+
+### 6.2 生成手部 pose JSONL
+
+使用 WiLoR 检测 21 点，并用 RealSense aligned depth 反投影到相机坐标系，输出 HumanEgo 转换脚本需要的：
+
+```jsonl
+{"host_time_s": ..., "side": "right", "T_hand_to_camera": [[...]], "grasp": ...}
+```
 
 ```bash
-python prepare_humanego_session.py \
-  --raw-session ./data/<raw_session_id> \
-  --humanego-root /data/lyx/HumanEgo \
-  --task serve_bread_rs \
-  --index 0 \
-  --source-type teaching \
+cd /data/lyx/WiLoR
+
+/data/lyx/miniconda3/envs/wilor/bin/python export_realsense_humanego_handposes.py \
+  --session /data/lyx/datasets/egodata/data0617_depth_ir/<raw_session_id> \
+  --out /data/lyx/datasets/egodata/data0617_depth_ir/<raw_session_id>/hand_poses_wilor.jsonl \
   --side right \
-  --hand-poses ./poses/session_000_hands.jsonl \
-  --camera-poses ./poses/session_000_camera.jsonl \
-  --require-hand-pose
+  --visualize
 ```
 
-预处理：
+调试时可以先只跑几帧：
+
+```bash
+/data/lyx/miniconda3/envs/wilor/bin/python export_realsense_humanego_handposes.py \
+  --session /data/lyx/datasets/egodata/data0617_depth_ir/<raw_session_id> \
+  --out /tmp/hand_poses_wilor_debug.jsonl \
+  --vis-out /tmp/hand_poses_wilor_debug.mp4 \
+  --start-frame 30 \
+  --max-frames 30 \
+  --side right \
+  --visualize
+```
+
+检查生成的 `<raw_session_id>/hand_poses_wilor_vis.mp4`：红点应落在 `wrist / thumb MCP / thumb tip / index MCP / index tip`，RGB 箭头表示导出的 `T_hand_to_camera`。
+
+### 6.3 转换为 HumanEgo dataset session
+
+```bash
+/data/lyx/miniconda3/envs/wilor/bin/python /data/lyx/humanego_reproduce/realsense_collect_data/prepare_humanego_session.py \
+  --raw-session /data/lyx/datasets/egodata/data0617_depth_ir/<raw_session_id> \
+  --humanego-root /data/lyx/HumanEgo \
+  --task pick_banana_into_the_pot \
+  --index <session_index> \
+  --source-type teaching \
+  --side right \
+  --hand-poses /data/lyx/datasets/egodata/data0617_depth_ir/<raw_session_id>/hand_poses_wilor.jsonl \
+  --force
+```
+
+当前已跑过的两个例子：
+
+```bash
+/data/lyx/miniconda3/envs/wilor/bin/python /data/lyx/humanego_reproduce/realsense_collect_data/prepare_humanego_session.py \
+  --raw-session /data/lyx/datasets/egodata/data0617_depth_ir/20260617_155420_318122300934 \
+  --humanego-root /data/lyx/HumanEgo \
+  --task pick_banana_into_the_pot \
+  --index 1 \
+  --source-type teaching \
+  --side right \
+  --hand-poses /data/lyx/datasets/egodata/data0617_depth_ir/20260617_155420_318122300934/hand_poses_wilor.jsonl \
+  --force
+
+/data/lyx/miniconda3/envs/wilor/bin/python /data/lyx/humanego_reproduce/realsense_collect_data/prepare_humanego_session.py \
+  --raw-session /data/lyx/datasets/egodata/data0617_depth_ir/20260617_155442_318122300934 \
+  --humanego-root /data/lyx/HumanEgo \
+  --task pick_banana_into_the_pot \
+  --index 2 \
+  --source-type teaching \
+  --side right \
+  --hand-poses /data/lyx/datasets/egodata/data0617_depth_ir/20260617_155442_318122300934/hand_poses_wilor.jsonl \
+  --force
+```
+
+输出目录：
+
+```text
+/data/lyx/HumanEgo/data/pick_banana_into_the_pot/teaching/teaching_pick_banana_into_the_pot_001/
+/data/lyx/HumanEgo/data/pick_banana_into_the_pot/teaching/teaching_pick_banana_into_the_pot_002/
+```
+
+### 6.4 写/检查 task 预处理配置
+
+`RobotPreprocess --task pick_banana_into_the_pot` 会读取：
+
+```text
+/data/lyx/HumanEgo/cfg/preprocess/tasks/pick_banana_into_the_pot.yaml
+```
+
+当前应为：
+
+```yaml
+DINOSAM:
+  dinosam_prompt:
+    obj1: "a pot ."
+    obj2: "a banana ."
+    arm: "robot arms . robot hands ."
+```
+
+这里建议 `obj1=pot`，`obj2=banana`。HumanEgo 会把第一个 object 当作 `virtual_static_anchor`，锅更适合作为静态容器/锚点，香蕉更适合作为动态物体。
+
+### 6.5 跑 HumanEgo RobotPreprocess
 
 ```bash
 cd /data/lyx/HumanEgo
-python -m preprocess.RobotPreprocess --session_path ./data/serve_bread_rs/teaching --task serve_bread_rs --start_from auto
+
+python -m preprocess.RobotPreprocess \
+  --session_path /data/lyx/HumanEgo/data/pick_banana_into_the_pot/teaching/teaching_pick_banana_into_the_pot_001 \
+  --task pick_banana_into_the_pot \
+  --start_from init
 ```
 
-训练：
+批量处理 `teaching/` 下所有 session：
 
 ```bash
-python -m training.FlowMatchingTrainer --task serve_bread_rs --use_cfg --job HumanEgo
+python -m preprocess.RobotPreprocess \
+  --session_path /data/lyx/HumanEgo/data/pick_banana_into_the_pot/teaching \
+  --task pick_banana_into_the_pot \
+  --start_from auto
+```
+
+如果只改了 DINO/SAM prompt，且 `preprocess/cfg/` 已经存在，可以从 `dinosam` 重新跑：
+
+```bash
+python -m preprocess.RobotPreprocess \
+  --session_path /data/lyx/HumanEgo/data/pick_banana_into_the_pot/teaching/teaching_pick_banana_into_the_pot_001 \
+  --task pick_banana_into_the_pot \
+  --start_from dinosam
+```
+
+跑完重点检查：
+
+```text
+preprocess/dinosam_mask_obj1.png       # pot
+preprocess/dinosam_mask_obj2.png       # banana
+preprocess/kptsselector_results.json   # objects 里应有 obj1 和 obj2
+preprocess/depthlifter_results.json    # objects 里应有 obj1 和 obj2
+preprocess/all_data/00000/training_data.json
+```
+
+### 6.6 写训练配置并训练
+
+如果还没有训练配置，先创建：
+
+```bash
+mkdir -p /data/lyx/HumanEgo/cfg/training/pick_banana_into_the_pot
+cp /data/lyx/HumanEgo/cfg/training/serve_bread/HumanEgo.yaml \
+   /data/lyx/HumanEgo/cfg/training/pick_banana_into_the_pot/HumanEgo.yaml
+```
+
+然后打开：
+
+```text
+/data/lyx/HumanEgo/cfg/training/pick_banana_into_the_pot/HumanEgo.yaml
+```
+
+至少确认：
+
+```yaml
+single_hand: True
+single_hand_side: "right"
+hand_tracking_method: "aria_mps"
+data_sources:
+  teaching: 10
+eval_source: "teaching"
+data_root: "./data"
+```
+
+启动 smoke test：
+
+```bash
+cd /data/lyx/HumanEgo
+
+python -m training.FlowMatchingTrainer \
+  --task pick_banana_into_the_pot \
+  --use_cfg \
+  --job HumanEgo \
+  --epochs 5 \
+  --data_num 1
+```
+
+正式训练：
+
+```bash
+python -m training.FlowMatchingTrainer \
+  --task pick_banana_into_the_pot \
+  --use_cfg \
+  --job HumanEgo
 ```
