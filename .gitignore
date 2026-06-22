@@ -1,1 +1,4 @@
 data/
+WiLoR/pretrained_models/*
+*.pt
+*.ckpt

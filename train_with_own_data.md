@@ -33,6 +33,30 @@ aligned RGB-D + camera intrinsics + hand pose/grasp (+ camera pose)
 -> training.FlowMatchingTrainer
 ```
 
+## 当前状态与 TODO
+
+当前策略：**第一阶段默认 RealSense 固定不动**，用 HumanEgo 已有 `RobotPreprocess + DepthLifter` 打通数据链路；运动 RealSense 作为第二阶段扩展，不直接改 HumanEgo 主项目代码。
+
+已具备：
+
+- `read_frames.py` 已能采集 aligned RGB-D、RealSense 内参 `K`、depth scale 和逐帧时间戳。
+- `prepare_humanego_session.py` 已能把 raw RealSense session 转成 HumanEgo `RobotPreprocess` 需要的 `session_meta.json + all_data/<idx>/rgb.png/depth.png/robot_state.json`。
+- HumanEgo 已有 `RobotPreprocess`，可以从 RGB-D 估计物体 `T_obj_to_world`，再生成 `training_data.json`。
+
+**TODO - 当前必须补齐：**
+
+- **TODO 1：HaWoR/WaVoR 输出每帧 21 个 3D hand keypoints。** 需要有时间戳，最好和 RealSense `frames.jsonl` 的 `host_time_s` 同源。
+- **TODO 2：确认 21 keypoints 顺序，并 remap 到 HumanEgo/Aria 约定。** HumanEgo 关键索引假设包括 `0=thumb tip`、`1=index tip`、`5=wrist`、`6=thumb base/MCP`、`8=index MCP`、`11=middle MCP`、`20=palm center`。这个映射错了，末端 pose 和 grasp 都会错。
+- **TODO 3：新增/补充一个 keypoints-to-gripper 脚本。** 输入 HaWoR/WaVoR 21 点，输出每帧 `T_hand_to_camera` 或 `T_hand_to_world`，以及 `grasp` 或 `gripper_q`。
+- **TODO 4：验证时间同步。** 检查 hand pose 与 RGB-D 帧的最近邻时间差，`missing_hand_frames` 应接近 0，典型阈值先用 `--max-pose-dt-s 0.05`。
+- **TODO 5：写 task YAML。** 明确 `obj1/obj2/...` 的 DINO/SAM prompt，否则物体 mask 错了后面全部错。
+
+**TODO - 运动 RealSense 第二阶段：**
+
+- **TODO 6：若 RealSense 是头戴/手持运动相机，必须额外记录 `T_camera_to_world`。** 这一步只是记录还不够，因为当前 HumanEgo `DepthLifter` 默认静态相机。
+- **TODO 7：新增 moving-camera object lifting 脚本。** 不改 HumanEgo 主代码的前提下，可以在 `humanego_reproduce` 新增脚本，读取 `cotracker_results.json + depth.png + K + 每帧 T_camera_to_world`，生成与 `depthlifter_results.json` 等价的结果，再从 `RobotPreprocess --start_from lama` 或 `--start_from datasetgen` 继续。
+- **TODO 8：或者新增 Aria-like 适配脚本。** 把每帧 `K/c2w/rgb` 写成 `aria_cam_rgb.json` 风格，再复用 `CamTriangulator` 的 SLAM 多视角三角化思路。这个更接近论文，但适配量更大。
+
 ## 0. 还需要采集什么
 
 你现在脚本原来只采了 `RGB mp4 + depth png`。这不够训练 HumanEgo，因为训练监督需要手部 6DoF 轨迹、抓取状态和物体 3D 位姿。物体 3D 位姿可以由 RGB-D 后处理估计，手部位姿必须额外提供。
@@ -50,13 +74,33 @@ aligned RGB-D + camera intrinsics + hand pose/grasp (+ camera pose)
 | `T_camera_to_world` | 移动相机必须 | 接近 Aria 的 ego camera trajectory | 由 HaWoR/SLAM 导出 JSONL |
 | task object prompts | 必须 | 指定要分割/跟踪的物体 | 写到 `cfg/preprocess/tasks/<task>.yaml` |
 
+手部 21 点到末端控制量的计划：
+
+```text
+HaWoR/WaVoR 21 keypoints
+-> remap 到 HumanEgo/Aria keypoint order
+-> thumb/index tips 算 midpoint
+-> thumb/index MCP + wrist 构造 gripper-like orientation
+-> thumb-index distance / palm size 算 grasp
+-> 输出 hand pose JSONL，供 prepare_humanego_session.py 对齐
+```
+
+推荐输出格式：
+
+```jsonl
+{"host_time_s": 1790000000.123, "side": "right", "T_hand_to_camera": [[...]], "grasp": 0.0}
+{"host_time_s": 1790000000.156, "side": "right", "T_hand_to_camera": [[...]], "grasp": 1.0}
+```
+
+**TODO：** 目前还需要新增这个 “21 keypoints -> `T_hand_to_camera/world` + `grasp`” 脚本；现有转换脚本假设这一步已经完成。
+
 如果你想尽可能贴近 Aria：
 
 - Aria 的 `sample.vrs` 自带多传感器同步、相机标定、IMU、SLAM camera、RGB；MPS 输出 camera/device trajectory 和 hand tracking。
 - RealSense 方案要补齐等价信息：RGB-D 时间同步、相机内参、相机轨迹、手部轨迹、抓取状态。
 - 当前 HumanEgo `RobotPreprocess` 的 `DepthLifter` 更适合固定 RealSense 相机，因为它默认 `cam0` 是世界坐标。若 RealSense 真的是头戴/手持移动 ego 相机，应仍然采集 `T_camera_to_world`，但当前不改 HumanEgo 主代码时，物体 3D lifting 还不能完全等价 Aria 的 moving-camera triangulation。这是主要差距。
 
-实操建议：第一版先用固定 RealSense 或运动很小的 RealSense，把流程跑通；然后再针对 moving ego camera 增加“使用每帧 camera pose 的 RGB-D object lifting/triangulation”阶段。
+实操建议：第一版先用固定 RealSense，把 `RobotPreprocess` 原样跑通；然后再针对 moving ego camera 增加“使用每帧 camera pose 的 RGB-D object lifting/triangulation”阶段。
 
 ## 1. 数据采集脚本修改后会输出什么
 
@@ -97,6 +141,25 @@ aligned RGB-D + camera intrinsics + hand pose/grasp (+ camera pose)
 - `depth_path`
 
 这些字段用于后续把 HaWoR 的手/相机位姿按时间戳对齐到每帧 RGB-D。
+
+当前固定 RealSense 约定：
+
+```text
+world = RealSense RGB camera frame
+T_camera_to_world = Identity
+```
+
+在这个约定下，如果 HaWoR 输出的是 `T_hand_to_camera`，它也可以直接作为训练用的 `T_hand_to_world` 写入 `robot_state.json`。转换脚本仍支持传入 `--camera-poses`，但固定相机第一阶段可以不提供，默认用 identity。
+
+运动 RealSense 约定：
+
+```text
+world = 第一帧相机坐标系或 SLAM/world 坐标系
+每帧必须有 T_camera_to_world
+T_hand_to_world = T_camera_to_world @ T_hand_to_camera
+```
+
+**TODO：** 运动 RealSense 时，手部 pose 可以通过转换脚本变到 world；但物体 `T_obj_to_world` 仍需要新增 moving-camera object lifting，不能完全依赖当前静态 `DepthLifter`。
 
 ## 2. Step-by-step 采集 pipeline
 
@@ -165,6 +228,36 @@ python read_frames.py \
 - `gripper_q`：HumanEgo robot 约定，0 表示闭合/抓取，1 表示张开。脚本会把 `grasp` 转成 `gripper_q = 1 - grasp`。
 
 如果没有 `grasp/gripper_q`，转换脚本会使用 `--default-gripper-q`。这只能跑通流程，不建议用于正式训练。
+
+### Step 3.1. 将 21 keypoints 转成末端位姿和 gripper
+
+这是当前最关键的待补脚本，不属于 HumanEgo 主项目，建议新增在：
+
+```text
+/data/lyx/humanego_reproduce/realsense_collect_data/hand_keypoints_to_gripper.py
+```
+
+输入建议：
+
+```jsonl
+{"host_time_s": 1790000000.123, "side": "right", "keypoints_3d_camera": [[x,y,z], ... 21 points ...], "confidence": 0.9}
+```
+
+输出建议：
+
+```jsonl
+{"host_time_s": 1790000000.123, "side": "right", "T_hand_to_camera": [[...]], "grasp": 0.0, "confidence": 0.9}
+```
+
+算法计划：
+
+1. `remap_keypoints()`：把 HaWoR/WaVoR keypoint order 转到 HumanEgo/Aria order。
+2. `build_gripper_pose()`：用 `thumb_tip/index_tip/wrist/thumb_base/index_base` 构造 midpoint frame。
+3. `estimate_grasp()`：用 `||thumb_tip - index_tip|| / ||middle_mcp - wrist||` 判断 grasp，初始阈值用 `1.0`，后续根据数据调。
+4. `smooth_pose_and_grasp()`：可选，先做简单滑动窗口/中值滤波，避免 grasp 抖动。
+5. 写 hand pose JSONL 给 `prepare_humanego_session.py`。
+
+**TODO：** 需要用一小段真实 HaWoR/WaVoR 输出确认 keypoint order 和坐标单位。如果输出是 root-relative hand frame，而不是 camera/world frame，还需要额外把它恢复到 camera/world 坐标，否则不能直接训练。
 
 ## 3. Step-by-step 转换为 HumanEgo session
 
@@ -237,6 +330,17 @@ python prepare_humanego_session.py \
 6. 写每帧 `robot_state.json`。注意字段名仍叫 `T_ee_in_cam`，但 HumanEgo 的 `RobotDatasetGen` 会把它当成 `T_hand_to_world` 使用。
 7. 写 `session_meta.json`，包含 `K`、fps、宽高、帧数、source type。
 
+固定 RealSense 情况：
+
+- 可以不传 `--camera-poses`，转换脚本默认 `T_camera_to_world = I`。
+- 若 hand pose JSONL 里是 `T_hand_to_camera`，最终会等价写成 `T_hand_to_world`，因为 `world = camera frame`。
+
+运动 RealSense 情况：
+
+- 必须传 `--camera-poses`，否则手 pose 无法稳定对齐到 world。
+- 转换脚本能处理手部：`T_hand_to_world = T_camera_to_world @ T_hand_to_camera`。
+- **TODO：** 当前转换脚本不会改变 HumanEgo `DepthLifter` 的静态相机假设；运动相机时还需要新增 object lifting 结果生成脚本，见 Step 6.1。
+
 ### Step 5. 写 task 配置
 
 创建：
@@ -299,6 +403,73 @@ python -m preprocess.RobotPreprocess \
 6. `lama`：生成 `rgb_WoArm.png`。
 7. `visualkpts`：生成 `rgb_WArmObjKpts.png` 和 `rgb_WoArm_WArmObjKpts.png`。
 8. `datasetgen`：读取 `robot_state.json + depthlifter_results.json`，生成 `training_data.json`。
+
+固定 RealSense：
+
+- 当前 `RobotPreprocess` 原样支持。
+- `DepthLifter` 使用 `depth.png + K` 反投影物体 2D keypoints，默认 `cam0_c2w = Identity`。
+
+运动 RealSense：
+
+- 当前 `RobotPreprocess` 可以跑，但 `DepthLifter` 的物体世界坐标会隐含静态相机假设，不等价 Aria SLAM。
+- **TODO：** 不修改 HumanEgo 项目代码时，建议新增外部脚本生成 `preprocess/depthlifter_results.json`，然后让 `RobotPreprocess` 从后续阶段继续。
+
+### Step 6.1. 运动 RealSense 需要新增的 object lifting 步骤
+
+仅当 RealSense 运动时需要。固定 RealSense 跳过本节。
+
+当前 `DepthLifter` 做的是：
+
+```text
+2D object keypoint (u, v)
++ depth.png[v, u]
++ K
+-> p_cam
+-> p_world = p_cam   # 静态相机假设
+```
+
+运动 RealSense 应改成：
+
+```text
+2D object keypoint (u, v)
++ depth.png[v, u]
++ K
+-> p_cam_t
+-> p_world = T_camera_t_to_world @ p_cam_t
+```
+
+建议新增脚本，不改 HumanEgo 主代码：
+
+```text
+/data/lyx/humanego_reproduce/realsense_collect_data/moving_depthlifter_results.py
+```
+
+输入：
+
+```text
+HumanEgo session/preprocess/cotracker_results.json
+HumanEgo session/preprocess/all_data/<idx>/depth.png
+HumanEgo session/preprocess/all_data/<idx>/robot_state.json  # 里面已有 camera.T_camera_to_world
+HumanEgo session/preprocess/session_meta.json                # K
+```
+
+输出：
+
+```text
+HumanEgo session/preprocess/depthlifter_results.json
+```
+
+然后从后续阶段继续：
+
+```bash
+cd /data/lyx/HumanEgo
+python -m preprocess.RobotPreprocess \
+  --session_path ./data/serve_bread_rs/teaching/teaching_serve_bread_rs_000 \
+  --task serve_bread_rs \
+  --start_from lama
+```
+
+**TODO：** 这个 moving depthlifter 还未实现；当前文档第一阶段以固定 RealSense 为准。
 
 ### Step 7. 检查预处理结果
 
@@ -426,6 +597,13 @@ data/serve_bread_rs/teaching/
 4. RGB/depth 未对齐：`DepthLifter` 会在错误像素取深度，物体 3D pose 会错。
 5. `K` 不匹配最终图像尺寸：3D 尺度和位置会错。
 6. DINO/SAM prompt 不稳定：mask 错了，后面全部错。
+
+当前阶段的明确缺口：
+
+- **TODO：HaWoR/WaVoR 21 keypoints -> gripper pose/grasp 脚本未实现。** 没有这个，`prepare_humanego_session.py` 缺少正式 hand pose 输入。
+- **TODO：keypoint remapping 未验证。** 必须用真实 21 点样例确认 thumb/index/wrist/MCP/palm center 的索引。
+- **TODO：grasp 阈值未标定。** 初始可以用相对阈值 `thumb-index distance / palm_size < 1.0`，但需要看视频/曲线调。
+- **TODO：运动 RealSense 的 object lifting 未实现。** 固定 RealSense 可用现有 `DepthLifter`；运动相机要新增外部脚本生成 `depthlifter_results.json`。
 
 ## 6. 最小可运行命令总览
 
