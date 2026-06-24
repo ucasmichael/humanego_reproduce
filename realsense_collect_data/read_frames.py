@@ -13,6 +13,7 @@ Usage examples:
 import argparse
 import json
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -179,6 +180,66 @@ def draw_status(preview, recording, recorded_frames, elapsed):
     return preview
 
 
+class DepthFFV1Writer:
+    def __init__(self, path, width, height, fps):
+        self.path = Path(path)
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = int(fps)
+        self.frame_count = 0
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray16le",
+            "-s",
+            f"{self.width}x{self.height}",
+            "-r",
+            str(self.fps),
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-g",
+            "1",
+            str(self.path),
+        ]
+        try:
+            self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg is required for --depth-video-only but was not found in PATH.") from exc
+        if self.process.stdin is None:
+            raise RuntimeError("Could not open ffmpeg stdin for depth video.")
+
+    def write(self, depth_image):
+        if depth_image is None:
+            depth_image = np.zeros((self.height, self.width), dtype=np.uint16)
+        if depth_image.shape[:2] != (self.height, self.width):
+            raise RuntimeError(
+                f"Depth frame shape {depth_image.shape[:2]} does not match video size {(self.height, self.width)}"
+            )
+        if depth_image.dtype != np.uint16:
+            depth_image = depth_image.astype(np.uint16, copy=False)
+        depth_le = np.ascontiguousarray(depth_image.astype("<u2", copy=False))
+        self.process.stdin.write(depth_le.tobytes())
+        self.frame_count += 1
+
+    def close(self):
+        if self.process.stdin is not None and not self.process.stdin.closed:
+            self.process.stdin.close()
+        return_code = self.process.wait()
+        if return_code != 0:
+            raise RuntimeError(f"ffmpeg depth video writer failed with exit code {return_code}: {self.path}")
+
+
 class RecordingSession:
     def __init__(
         self,
@@ -195,6 +256,7 @@ class RecordingSession:
         depth_intrinsics,
         ir_intrinsics,
         save_frame_images=True,
+        depth_video_only=False,
     ):
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         serial_name = sanitize_name(serial)
@@ -205,12 +267,14 @@ class RecordingSession:
         self.depth_frame_dir = self.session_dir / "depth"
         self.ir_root = self.session_dir / "ir"
         self.rgb_path = self.session_dir / "rgb.mp4"
+        self.depth_video_path = self.session_dir / "depth_ffv1.mkv"
         self.metadata_path = self.session_dir / "metadata.json"
         self.frames_path = self.session_dir / "frames.jsonl"
         self.enable_depth = enable_depth
         self.enable_ir = enable_ir
         self.ir_streams = list(ir_streams)
         self.save_frame_images = save_frame_images
+        self.depth_video_only = depth_video_only
         self.color_intrinsics = color_intrinsics
         self.depth_intrinsics = depth_intrinsics
         self.ir_intrinsics = ir_intrinsics
@@ -218,7 +282,7 @@ class RecordingSession:
         self.session_dir.mkdir(parents=True, exist_ok=True)
         if self.save_frame_images:
             self.rgb_frame_dir.mkdir(parents=True, exist_ok=True)
-        if self.enable_depth:
+        if self.enable_depth and not self.depth_video_only:
             self.depth_frame_dir.mkdir(parents=True, exist_ok=True)
         if self.enable_ir:
             for stream_index in self.ir_streams:
@@ -228,6 +292,9 @@ class RecordingSession:
         self.writer = cv2.VideoWriter(str(self.rgb_path), fourcc, fps, (width, height))
         if not self.writer.isOpened():
             raise RuntimeError(f"Could not open RGB video writer: {self.rgb_path}")
+        self.depth_writer = None
+        if self.enable_depth and self.depth_video_only:
+            self.depth_writer = DepthFFV1Writer(self.depth_video_path, width, height, fps)
 
         self.serial = serial
         self.width = width
@@ -272,14 +339,21 @@ class RecordingSession:
 
         if self.enable_depth and depth_image is None:
             self.missing_depth_count += 1
+            if self.depth_writer is not None:
+                self.depth_writer.write(None)
+                depth_rel = self.depth_video_path.relative_to(self.session_dir).as_posix()
         elif self.enable_depth:
-            # Store raw RealSense z16 depth. Convert to millimetres later with
-            # raw_value * depth_scale_meters_per_unit * 1000.
-            depth_path = self.depth_frame_dir / f"{frame_index:06d}.png"
-            ok = cv2.imwrite(str(depth_path), depth_image)
-            if not ok:
-                raise RuntimeError(f"Could not write depth frame: {depth_path}")
-            depth_rel = depth_path.relative_to(self.session_dir).as_posix()
+            if self.depth_writer is not None:
+                self.depth_writer.write(depth_image)
+                depth_rel = self.depth_video_path.relative_to(self.session_dir).as_posix()
+            else:
+                # Store raw RealSense z16 depth. Convert to millimetres later with
+                # raw_value * depth_scale_meters_per_unit * 1000.
+                depth_path = self.depth_frame_dir / f"{frame_index:06d}.png"
+                ok = cv2.imwrite(str(depth_path), depth_image)
+                if not ok:
+                    raise RuntimeError(f"Could not write depth frame: {depth_path}")
+                depth_rel = depth_path.relative_to(self.session_dir).as_posix()
             self.depth_frame_count += 1
             has_depth = True
 
@@ -307,6 +381,7 @@ class RecordingSession:
             "host_time_s": time.time(),
             "rgb_path": rgb_rel,
             "depth_path": depth_rel,
+            "depth_video_frame_index": frame_index if self.depth_video_only and self.enable_depth else None,
             "ir_paths": ir_rel if self.enable_ir else None,
             "has_depth": has_depth,
             "has_ir": has_ir,
@@ -344,6 +419,8 @@ class RecordingSession:
             return self.summary()
 
         self.writer.release()
+        if self.depth_writer is not None:
+            self.depth_writer.close()
         self.frames_file.close()
         self.closed = True
         self._write_metadata(finished=True)
@@ -355,11 +432,13 @@ class RecordingSession:
             "session_dir": self.session_dir.resolve(),
             "rgb_path": self.rgb_path.resolve(),
             "rgb_frame_dir": self.rgb_frame_dir.resolve() if self.save_frame_images else None,
-            "depth_dir": self.depth_frame_dir.resolve() if self.enable_depth else None,
+            "depth_dir": self.depth_frame_dir.resolve() if self.enable_depth and not self.depth_video_only else None,
+            "depth_video_path": self.depth_video_path.resolve() if self.enable_depth and self.depth_video_only else None,
             "ir_dir": self.ir_root.resolve() if self.enable_ir else None,
             "metadata_path": self.metadata_path.resolve(),
             "frames_path": self.frames_path.resolve(),
             "depth_enabled": self.enable_depth,
+            "depth_video_only": self.depth_video_only,
             "ir_enabled": self.enable_ir,
             "rgb_frames": self.frame_count,
             "depth_frames": self.depth_frame_count,
@@ -380,8 +459,14 @@ class RecordingSession:
             "rgb_video": self.rgb_path.as_posix(),
             "rgb_frame_dir": self.rgb_frame_dir.as_posix() if self.save_frame_images else None,
             "depth_enabled": self.enable_depth,
-            "depth_dir": self.depth_frame_dir.as_posix() if self.enable_depth else None,
-            "depth_format": "16-bit PNG, raw RealSense z16 units" if self.enable_depth else None,
+            "depth_video_only": self.depth_video_only,
+            "depth_dir": self.depth_frame_dir.as_posix() if self.enable_depth and not self.depth_video_only else None,
+            "depth_video": self.depth_video_path.as_posix() if self.enable_depth and self.depth_video_only else None,
+            "depth_format": (
+                "FFV1 Matroska video, gray16le raw RealSense z16 units"
+                if self.enable_depth and self.depth_video_only
+                else "16-bit PNG, raw RealSense z16 units" if self.enable_depth else None
+            ),
             "depth_scale_meters_per_unit": self.depth_scale,
             "depth_aligned_to_color": self.enable_depth,
             "ir_enabled": self.enable_ir,
@@ -391,7 +476,7 @@ class RecordingSession:
             "color_intrinsics": self.color_intrinsics,
             "depth_intrinsics": self.depth_intrinsics,
             "ir_intrinsics": self.ir_intrinsics,
-            "humanego_note": "Use color_intrinsics.k with aligned depth. Convert depth PNG to millimetres before HumanEgo DepthLifter if depth_scale != 0.001.",
+            "humanego_note": "Use color_intrinsics.k with aligned depth. Depth is raw RealSense z16 units; convert raw_value * depth_scale_meters_per_unit to meters.",
             "frames_jsonl": self.frames_path.as_posix(),
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "finished": finished,
@@ -417,6 +502,8 @@ def print_recording_summary(summary):
         print(f"  RGB frames:     {summary['rgb_frame_dir']}")
     if summary["depth_dir"] is not None:
         print(f"  Depth frames:   {summary['depth_dir']}")
+    elif summary.get("depth_video_path") is not None:
+        print(f"  Depth video:    {summary['depth_video_path']}")
     else:
         print("  Depth frames:   disabled")
     print(f"  Metadata:       {summary['metadata_path']}")
@@ -524,6 +611,7 @@ def preview_and_record(pipeline, profile, args, serial):
                         depth_intrinsics=depth_intrinsics,
                         ir_intrinsics=ir_intrinsics,
                         save_frame_images=not args.no_frame_images,
+                        depth_video_only=args.depth_video_only,
                     )
                     segment_count += 1
                     print("\nRecording started. Press SPACE in the preview window to stop and save.")
@@ -565,11 +653,15 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=30, help="Stream FPS.")
     parser.add_argument("--data-dir", type=str, default="data", help="Output directory.")
     parser.add_argument("--no-depth", action="store_true", help="Record RGB only; do not stream or save depth frames.")
+    parser.add_argument("--depth-video-only", action="store_true", help="Save aligned uint16 depth only as FFV1 gray16le video; do not save per-frame depth PNGs.")
     parser.add_argument("--ir", action="store_true", help="Record infrared frames as 8-bit grayscale PNGs.")
     parser.add_argument("--ir-streams", type=int, nargs="+", default=[1], choices=[1, 2], help="Infrared stream indices to record, usually 1 or 1 2.")
     parser.add_argument("--no-frame-images", action="store_true", help="Do not save per-frame RGB PNGs; keeps only rgb.mp4 plus depth/metadata.")
     parser.add_argument("--depth", action="store_true", help=argparse.SUPPRESS)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.no_depth and args.depth_video_only:
+        parser.error("--depth-video-only requires depth streaming; do not combine it with --no-depth.")
+    return args
 
 
 def main():
@@ -586,6 +678,8 @@ def main():
     print("Press ESC or q in the preview window to exit the recording loop.")
     if args.no_depth:
         print("Depth recording is disabled; RGB only mode is active.")
+    elif args.depth_video_only:
+        print("Depth video-only mode is active; aligned uint16 depth is piped to ffmpeg/FFV1 and depth PNGs are not saved.")
     if args.ir:
         print(f"Infrared recording is enabled for stream(s): {args.ir_streams}.")
 
