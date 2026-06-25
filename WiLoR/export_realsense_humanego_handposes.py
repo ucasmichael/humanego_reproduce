@@ -68,6 +68,15 @@ CORE_VIS_KEYPOINTS = [
     ARIA_REQUIRED["index_base"],
 ]
 
+CORE_WILOR_DEPTH_ANCHORS = {
+    0: None,  # wrist
+    2: None,  # thumb MCP
+    4: 2,     # thumb tip -> thumb MCP
+    5: None,  # index MCP
+    8: 5,     # index tip -> index MCP
+}
+STABLE_WILOR_DEPTH_IDS = [0, 2, 5, 9, 13, 17]
+
 
 def read_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
@@ -224,6 +233,43 @@ def depth_lift_keypoints(
             keypoints_3d[idx] = backproject(float(u), float(v), z, K)
 
     return keypoints_3d, depth_samples, sample_counts
+
+
+def correct_core_depth_outliers(
+    keypoints_3d_wilor: np.ndarray,
+    keypoints_2d_wilor: np.ndarray,
+    K: np.ndarray,
+    max_deviation_m: float,
+) -> Tuple[np.ndarray, List[int]]:
+    """Keep gripper pose from jumping when fingertip depth samples hit background."""
+    if max_deviation_m <= 0:
+        return keypoints_3d_wilor, []
+
+    corrected = np.asarray(keypoints_3d_wilor, dtype=np.float64).copy()
+    stable_z = corrected[STABLE_WILOR_DEPTH_IDS, 2]
+    stable_z = stable_z[np.isfinite(stable_z)]
+    if stable_z.size < 2:
+        return corrected, []
+
+    ref_z = float(np.median(stable_z))
+    changed: List[int] = []
+    for idx, anchor_idx in CORE_WILOR_DEPTH_ANCHORS.items():
+        z = float(corrected[idx, 2])
+        if math.isfinite(z) and abs(z - ref_z) <= max_deviation_m:
+            continue
+
+        replacement_z = ref_z
+        if anchor_idx is not None:
+            anchor_z = float(corrected[anchor_idx, 2])
+            if math.isfinite(anchor_z) and abs(anchor_z - ref_z) <= max_deviation_m:
+                replacement_z = anchor_z
+
+        u, v = keypoints_2d_wilor[idx]
+        if np.isfinite([u, v]).all() and math.isfinite(replacement_z):
+            corrected[idx] = backproject(float(u), float(v), replacement_z, K)
+            changed.append(idx)
+
+    return corrected, changed
 
 
 def safe_normalize(vec: np.ndarray, eps: float = 1e-6) -> Optional[np.ndarray]:
@@ -481,6 +527,8 @@ def main() -> int:
     parser.add_argument("--grasp-threshold", type=float, default=1.0, help="thumb-index distance / palm size threshold")
     parser.add_argument("--grasp-smooth-window", type=int, default=3)
     parser.add_argument("--fallback-wilor-depth", action="store_true", help="Fill invalid depth keypoints with WiLoR camera estimates")
+    parser.add_argument("--max-core-depth-deviation", type=float, default=0.12, help="Replace core gripper keypoint depth if it deviates from wrist/MCP median by more than this many meters")
+    parser.add_argument("--disable-core-depth-filter", action="store_true", help="Disable robust depth correction for wrist/thumb/index gripper keypoints")
     parser.add_argument("--start-frame", type=int, default=0, help="Skip frames before this manifest position")
     parser.add_argument("--frame-stride", type=int, default=1, help="Process every Nth frame")
     parser.add_argument("--max-frames", type=int, default=None, help="Process only first N frames for debugging")
@@ -570,6 +618,17 @@ def main() -> int:
             fill_mask = (~valid_depth) & wilor_z_ok
             kpts_depth[fill_mask] = wilor_kpts[fill_mask]
 
+        depth_outlier_corrected = []
+        if not args.disable_core_depth_filter:
+            kpts_depth, depth_outlier_corrected = correct_core_depth_outliers(
+                kpts_depth,
+                pred["keypoints_2d"],
+                K,
+                args.max_core_depth_deviation,
+            )
+            for corrected_idx in depth_outlier_corrected:
+                depth_samples[corrected_idx] = kpts_depth[corrected_idx, 2]
+
         valid_count = int(np.isfinite(kpts_depth[:, 2]).sum())
         if valid_count < args.min_valid_keypoints:
             stats["bad_depth"] += 1
@@ -606,6 +665,7 @@ def main() -> int:
             "keypoints_3d_camera_wilor": kpts_depth,
             "depth_samples_m": depth_samples,
             "depth_sample_counts": sample_counts,
+            "depth_outlier_corrected_wilor": depth_outlier_corrected,
             "wilor_keypoints_camera": pred["wilor_keypoints_camera"],
         }
         rows.append(row)

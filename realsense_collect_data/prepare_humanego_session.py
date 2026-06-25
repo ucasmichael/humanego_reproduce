@@ -350,6 +350,8 @@ def main() -> int:
                 args.side: {
                     "T_ee_in_cam": T_hand_world.tolist(),
                     "gripper_q": float(gripper_q),
+                    "pose_convention": "humanego_gripper_y_approach",
+                    "pose_source": "hand_pose_jsonl",
                 }
             },
             "camera": {
